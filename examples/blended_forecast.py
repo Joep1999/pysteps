@@ -16,10 +16,17 @@ import numpy as np
 from matplotlib import pyplot as plt
 
 import pysteps
+print(pysteps.__file__)
+
 from pysteps import io, rcparams, blending
 from pysteps.visualization import plot_precip_field
-from pysteps.cascade import decomposition
 
+from pysteps import utils
+from pysteps.cascade.bandpass_filters import filter_gaussian
+from pysteps.cascade import decomposition
+from pysteps.utils import conversion, transformation
+
+from pysteps.blending import steps
 
 ################################################################################
 # Read the radar images and the NWP forecast
@@ -35,6 +42,7 @@ from pysteps.cascade import decomposition
 
 # Selected case
 date_radar = datetime.strptime("202010310400", "%Y%m%d%H%M")
+date_radar_nowcast = datetime.strptime("202010310700", "%Y%m%d%H%M")
 # The last NWP forecast was issued at 00:00
 date_nwp = datetime.strptime("202010310000", "%Y%m%d%H%M")
 radar_data_source = rcparams.data_sources["bom"]
@@ -45,6 +53,8 @@ nwp_data_source = rcparams.data_sources["bom_nwp"]
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 root_path = radar_data_source["root_path"]
+root_path_nwp = '../../pysteps-data/nwp/bom'
+root_path = '../../pysteps-data/radar/bom'
 path_fmt = "prcp-c10/66/%Y/%m/%d"
 fn_pattern = "66_%Y%m%d_%H%M00.prcp-c10"
 fn_ext = radar_data_source["fn_ext"]
@@ -52,18 +62,24 @@ importer_name = radar_data_source["importer"]
 importer_kwargs = radar_data_source["importer_kwargs"]
 timestep = 10.0
 
+
 # Find the radar files in the archive
 fns = io.find_by_date(
     date_radar, root_path, path_fmt, fn_pattern, fn_ext, timestep, num_prev_files=2
 )
 
+fns_radarnowcast = io.find_by_date(
+    date_radar_nowcast, root_path, path_fmt, fn_pattern, fn_ext, timestep, num_prev_files=18
+)
+
 # Read the radar composites
 importer = io.get_method(importer_name, "importer")
 radar_precip, _, radar_metadata = io.read_timeseries(fns, importer, **importer_kwargs)
+radar_precip_nowcast, _, radar_metadata_nowcast = io.read_timeseries(fns_radarnowcast, importer, **importer_kwargs)
 
 # Import the NWP data
 filename = os.path.join(
-    nwp_data_source["root_path"],
+    root_path_nwp,
     datetime.strftime(date_nwp, nwp_data_source["path_fmt"]),
     datetime.strftime(date_nwp, nwp_data_source["fn_pattern"])
     + "."
@@ -79,8 +95,42 @@ nwp_precip, _, nwp_metadata = nwp_importer(filename)
 nwp_precip = nwp_precip[24:43, :, :]
 
 
+# Convert to rain rate
+radar_precip_nowcast, radar_metadata_nowcast = conversion.to_rainrate(radar_precip_nowcast, radar_metadata_nowcast)
 
+# Nicely print the metadata
+print(radar_metadata_nowcast)
 
+# Plot the rainfall field
+# plot_precip_field(radar_precip_nowcast[0], geodata=radar_metadata_nowcast)
+# plt.show()
+
+# Log-transform the data
+radar_precip_nowcast, radar_metadata_nowcast = transformation.dB_transform(radar_precip_nowcast, radar_metadata_nowcast, threshold=0.1, zerovalue=-15.0)
+
+filter = filter_gaussian(radar_precip_nowcast[0].shape, 6)
+
+cascade_connected = []
+for i in range(radar_precip_nowcast.shape[0]):
+    cascades = decomposition.decomposition_fft(
+        radar_precip_nowcast[i],
+        bp_filter = filter, 
+        n_levels=6, 
+        method="fft",
+        fft_method='numpy',     
+        input_domain='spatial',
+        output_domain='spatial',
+        compute_stats=True,
+        normalize=True,
+        compact_output=True)
+        
+    # cascade_connected.append(cascades['cascade_levels'])
+    cascade_connected.append(cascades)
+from pysteps.nowcasts import utils as nowcast_utils
+cascade_connected_stacked = nowcast_utils.stack_cascades(
+        cascade_connected, 6
+    )
+cascade_connected_np = np.array(cascade_connected)
 ################################################################################
 # Pre-processing steps
 # --------------------
@@ -95,24 +145,24 @@ radar_precip[radar_precip < 0.1] = 0.0
 nwp_precip[nwp_precip < 0.1] = 0.0
 
 # Plot the radar rainfall field and the first time step of the NWP forecast.
-date_str = datetime.strftime(date_radar, "%Y-%m-%d %H:%M")
-plt.figure(figsize=(10, 5))
-plt.subplot(121)
-plot_precip_field(
-    radar_precip[-1, :, :],
-    geodata=radar_metadata,
-    title=f"Radar observation at {date_str}",
-    colorscale="STEPS-NL",
-)
-plt.subplot(122)
-plot_precip_field(
-    nwp_precip[0, :, :],
-    geodata=nwp_metadata,
-    title=f"NWP forecast at {date_str}",
-    colorscale="STEPS-NL",
-)
-plt.tight_layout()
-plt.show()
+# date_str = datetime.strftime(date_radar, "%Y-%m-%d %H:%M")
+# plt.figure(figsize=(10, 5))
+# plt.subplot(121)
+# plot_precip_field(
+#     radar_precip[-1, :, :],
+#     geodata=radar_metadata,
+#     title=f"Radar observation at {date_str}",
+#     colorscale="STEPS-NL",
+# )
+# plt.subplot(122)
+# plot_precip_field(
+#     nwp_precip[0, :, :],
+#     geodata=nwp_metadata,
+#     title=f"NWP forecast at {date_str}",
+#     colorscale="STEPS-NL",
+# )
+# plt.tight_layout()
+# plt.show()
 
 # transform the data to dB
 transformer = pysteps.utils.get_method("dB")
@@ -160,8 +210,10 @@ velocity_nwp = np.stack(velocity_nwp)
 # The blended forecast
 # --------------------
 
-precip_forecast = blending.steps.forecast(
+precip_forecast_stacked = blending.steps.forecast(
     precip=radar_precip,
+    precip_nowcast=cascade_connected_stacked,
+    nowcasting_method='DGMR',
     precip_models=nwp_precip,
     velocity=velocity_radar,
     velocity_models=velocity_nwp,
@@ -171,15 +223,14 @@ precip_forecast = blending.steps.forecast(
     n_ens_members=1,
     precip_thr=radar_metadata["threshold"],
     kmperpixel=radar_metadata["xpixelsize"] / 1000.0,
-    noise_method=None,
     noise_stddev_adj=None,
     vel_pert_method=None,
 )
 
 # Transform the data back into mm/h
-precip_forecast, _ = converter(precip_forecast, radar_metadata)
-radar_precip, _ = converter(radar_precip, radar_metadata)
-nwp_precip, _ = converter(nwp_precip, nwp_metadata)
+precip_forecast_mm, _ = converter(precip_forecast, radar_metadata)
+radar_precip_mm, _ = converter(radar_precip, radar_metadata)
+nwp_precip_mm, _ = converter(nwp_precip, nwp_metadata)
 
 
 ################################################################################
@@ -192,6 +243,9 @@ nwp_precip, _ = converter(nwp_precip, nwp_metadata)
 # However, near the end of the forecast (+180 min), the NWP share in the blended
 # forecast has become more important and the forecast starts to resemble the
 # NWP forecast more.
+if radar_precip_nowcast.ndim == 3:
+    radar_precip_nowcast = radar_precip_nowcast[None, :]
+
 
 fig = plt.figure(figsize=(5, 12))
 
@@ -199,7 +253,8 @@ leadtimes_min = [30, 60, 90, 120, 150, 180]
 n_leadtimes = len(leadtimes_min)
 for n, leadtime in enumerate(leadtimes_min):
     # Nowcast with blending into NWP
-    plt.subplot(n_leadtimes, 2, n * 2 + 1)
+
+    plt.subplot(n_leadtimes, 3, n * 3 + 1)
     plot_precip_field(
         precip_forecast[0, int(leadtime / timestep) - 1, :, :],
         geodata=radar_metadata,
@@ -210,7 +265,8 @@ for n, leadtime in enumerate(leadtimes_min):
     )
 
     # Raw NWP forecast
-    plt.subplot(n_leadtimes, 2, n * 2 + 2)
+
+    plt.subplot(n_leadtimes, 3, n * 3 + 2)
     plot_precip_field(
         nwp_precip[0, int(leadtime / timestep) - 1, :, :],
         geodata=nwp_metadata,
@@ -220,6 +276,18 @@ for n, leadtime in enumerate(leadtimes_min):
         colorbar=False,
     )
 
+    # Raw precip forecast
+    plt.subplot(n_leadtimes, 3, n * 3 + 3)
+
+    plot_precip_field(
+        radar_precip_nowcast[0, int(leadtime / timestep) - 1, :, :],
+        geodata=radar_metadata,
+        title=f"precip +{leadtime} min",
+        axis="off",
+        colorscale="STEPS-NL",
+        colorbar=False,
+    )
+plt.show()
 
 ################################################################################
 # References

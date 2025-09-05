@@ -2003,7 +2003,7 @@ class StepsBlendingNowcaster:
                 # use the deterministic DGMR model computed externally if
                 # perturbations are disabled
                 worker_state.precip_cascades[j][i] = (
-                    self.__precip_nowcast[t][i]
+                    self.__precip_nowcast[i][t:t+2]
                 )
 
                 
@@ -2018,6 +2018,7 @@ class StepsBlendingNowcaster:
                     print('input shape')
                     
                     print(worker_state.precip_cascades.shape)
+                    print(worker_state.precip_cascades.min())
                     worker_state.precip_cascades[j][i] = autoregression.iterate_ar_model(
                         worker_state.precip_cascades[j][i], self.__params.PHI[i, :]
                     )
