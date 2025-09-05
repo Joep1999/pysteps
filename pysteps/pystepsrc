@@ -14,7 +14,7 @@
     },
     "data_sources": {
         "bom": {
-            "root_path": "./radar/bom",
+            "root_path": "../pysteps-data/radar/bom",
             "path_fmt": "prcp-cscn/2/%Y/%m/%d",
             "fn_pattern": "2_%Y%m%d_%H%M00.prcp-cscn",
             "fn_ext": "nc",

@@ -18,6 +18,7 @@ from matplotlib import pyplot as plt
 import pysteps
 from pysteps import io, rcparams, blending
 from pysteps.visualization import plot_precip_field
+from pysteps.cascade import decomposition
 
 
 ################################################################################
@@ -76,6 +77,8 @@ nwp_precip, _, nwp_metadata = nwp_importer(filename)
 # onwards
 
 nwp_precip = nwp_precip[24:43, :, :]
+
+
 
 
 ################################################################################
@@ -168,7 +171,8 @@ precip_forecast = blending.steps.forecast(
     n_ens_members=1,
     precip_thr=radar_metadata["threshold"],
     kmperpixel=radar_metadata["xpixelsize"] / 1000.0,
-    noise_stddev_adj="auto",
+    noise_method=None,
+    noise_stddev_adj=None,
     vel_pert_method=None,
 )
 

@@ -8,26 +8,30 @@ Implementation of the STEPS stochastic blending method as described in
 consists of the following main steps:
 
     #. Set the radar rainfall fields in a Lagrangian space.
-    #. Perform the cascade decomposition for the input radar rainfall fields.
+    #. Perform the cascade decomposition for the input nowcasting model fields.
        The method assumes that the cascade decomposition of the NWP model fields is
        already done prior to calling the function, as the NWP model fields are
        generally not updated with the same frequency (which is more efficient). A
        method to decompose and store the NWP model fields whenever a new NWP model
        field is present, is present in pysteps.blending.utils.decompose_NWP.
-    #. Initialize the noise method.
-    #. Estimate AR parameters for the extrapolation nowcast and noise cascade.
-    #. Initialize all the random generators.
+    #. Initialize the noise method. -> if noise is set to true
+    #. Estimate AR parameters for the extrapolation nowcast and noise cascade. -> only for noise
+    #. Initialize all the random generators. -> not necessary
     #. Calculate the initial skill of the NWP model forecasts at t=0.
     #. Start the forecasting loop:
         #. Determine which NWP models will be combined with which nowcast ensemble
            member. The number of output ensemble members equals the maximum number
            of (ensemble) members in the input, which can be either the defined
            number of (nowcast) ensemble members or the number of NWP models/members.
+
+           if the nowcast is deterministic, blend the single nowcast with each member of the NWP models/members
+           if the NWP model is deterministic, blend each member of the nowcast with the same member of NWP
+
         #. Determine the skill and weights of the forecasting components
            (extrapolation, NWP and noise) for that lead time.
         #. Regress the extrapolation and noise cascades separately to the subsequent
-           time step.
-        #. Extrapolate the extrapolation and noise cascades to the current time step.
+           time step.-> not necessary
+        #. Extrapolate the extrapolation and noise cascades to the current time step. -> not necessary
         #. Blend the cascades.
         #. Recompose the cascade to a rainfall field.
         #. Post-processing steps (masking and probability matching, which are
@@ -277,7 +281,6 @@ class StepsBlendingConfig:
     extrapolation_method: str
     decomposition_method: str
     bandpass_filter_method: str
-    nowcasting_method: str
     noise_method: str | None
     noise_stddev_adj: str | None
     ar_order: int
@@ -302,6 +305,15 @@ class StepsBlendingConfig:
     measure_time: bool = False
     callback: Any | None = None
     return_output: bool = True
+    
+    #if set to true, blending will be done deterministically
+    blend_det: bool = True
+    
+    #if set to true, blending will happen without noise component
+    blend_raw_forecasts: bool = True
+
+    #if set to true, blending will use external weights 
+    use_blending_weights_external = False
 
 
 @dataclass
@@ -324,6 +336,7 @@ class StepsBlendingParams:
     struct: np.ndarray | None = None
     time_steps_is_list: bool = False
     precip_models_provided_is_cascade: bool = False
+    precip_provided_is_cascade: bool = False
     xy_coordinates: np.ndarray | None = None
     precip_zerovalue: float | None = None
     precip_threshold: float | None = None
@@ -414,7 +427,6 @@ class StepsBlendingNowcaster:
     def __init__(
         self,
         precip,
-        precip_nowcast,
         precip_models,
         velocity,
         velocity_models,
@@ -425,7 +437,6 @@ class StepsBlendingNowcaster:
         """Initializes the StepsBlendingNowcaster with inputs and configurations."""
         # Store inputs
         self.__precip = precip
-        self.__precip_nowcast = precip_nowcast
         self.__precip_models = precip_models
         self.__velocity = velocity
         self.__velocity_models = velocity_models
@@ -556,11 +567,11 @@ class StepsBlendingNowcaster:
             else:
                 self.__state.precip_noise_input = self.__precip.copy()
             self.__initialize_noise()
-            self.__estimate_ar_parameters_radar()
-            self.__multiply_precip_cascade_to_match_ensemble_members()
+            #self.__estimate_ar_parameters_radar()
+            #self.__multiply_precip_cascade_to_match_ensemble_members()
             self.__initialize_random_generators()
             self.__prepare_forecast_loop()
-            self.__initialize_noise_cascades()
+            #self.__initialize_noise_cascades()
             if self.__config.measure_time:
                 self.__init_time = self.__measure_time(
                     "initialization", self.__start_time_init
@@ -630,7 +641,7 @@ class StepsBlendingNowcaster:
                 worker_state = copy(self.__state)
                 self.__determine_NWP_skill_for_next_timestep(t, j, worker_state)
                 self.__determine_weights_per_component(worker_state)
-                self.__regress_extrapolation_and_noise_cascades(j, worker_state,t)
+                self.__regress_extrapolation_and_noise_cascades(j, worker_state)
                 self.__perturb_blend_and_advect_extrapolation_and_noise_to_current_timestep(
                     t, j, worker_state
                 )
@@ -695,16 +706,34 @@ class StepsBlendingNowcaster:
         """
         Validates the inputs and determines if the user provided raw forecasts or decomposed forecasts.
         """
-        # Check dimensions of precip
-        if self.__precip.ndim != 3:
+        
+        # Check dimensions of precip -> it can also be a decomposed cascade
+        precip_dim = self.__precip.ndim
+        if precip_dim == 2:
+            if isinstance(self.__precip[0][0], dict):
+                # It's a 2D array of dictionaries with decomposed cascades
+                self.__params.precip_provided_is_cascade = True
+            else:
+                raise ValueError(
+                    "When precip has ndim == 2, it must contain dictionaries with decomposed cascades."
+                )
+        elif precip_dim == 3:
+            self.__params.precip_provided_is_cascade = False
+            
+            if self.__precip.shape[0] < self.__config.ar_order + 1:
+                raise ValueError(
+                    f"precip must have at least {self.__config.ar_order + 1} time steps in the first dimension "
+                    f"to match the autoregressive order (ar_order={self.__config.ar_order})"
+                )
+
+        else:
             raise ValueError(
-                "precip must be a three-dimensional array of shape (ar_order + 1, m, n)"
+                "precip must be either a two-dimensional array containing dictionaries with decomposed precip fields"
+                "or a three-dimensional array containing the original radar precipitation fields as input to the pysteps nowcast"
             )
-        if self.__precip.shape[0] < self.__config.ar_order + 1:
-            raise ValueError(
-                f"precip must have at least {self.__config.ar_order + 1} time steps in the first dimension "
-                f"to match the autoregressive order (ar_order={self.__config.ar_order})"
-            )
+        
+
+        
 
         # Check dimensions of velocity
         if self.__velocity.ndim != 3:
@@ -731,12 +760,6 @@ class StepsBlendingNowcaster:
             raise ValueError(
                 "The number of members in the precipitation models and velocity models must match"
             )
-
-        #Check if the pre-computed nowcast has the same shape as the NWP
-        # if self.__precip_nowcast.shape[1:3] != self.__precip_models.shape[1:3]:
-        #     raise ValueError(
-        #         "The Spatial dimensions of the precipitation nowcast and nwp forecast must match"
-        #     )
 
         if isinstance(self.__timesteps, list):
             self.__params.time_steps_is_list = True
@@ -776,6 +799,8 @@ class StepsBlendingNowcaster:
                 "precip_models must be either a two-dimensional array containing dictionaries with decomposed model fields"
                 "or a four-dimensional array containing the original (NWP) model forecasts"
             )
+
+        
 
         if self.__config.extrapolation_kwargs is None:
             self.__state.extrapolation_kwargs = dict()
@@ -872,9 +897,6 @@ class StepsBlendingNowcaster:
         print(
             f"input dimensions:            {self.__precip.shape[1]}x{self.__precip.shape[2]}"
         )
-        print(
-            f"input dimensions pre-computed nowcast:            {self.__precip_nowcast.shape[1]}x{self.__precip_nowcast.shape[2]}"
-        )
         if self.__config.kmperpixel is not None:
             print(f"km/pixel:                    {self.__config.kmperpixel}")
         if self.__config.timestep is not None:
@@ -895,7 +917,6 @@ class StepsBlendingNowcaster:
         print(f"extrapolation:               {self.__config.extrapolation_method}")
         print(f"bandpass filter:             {self.__config.bandpass_filter_method}")
         print(f"decomposition:               {self.__config.decomposition_method}")
-        print(f"nowcasting algorithm:        {self.__config.nowcasting_method}")
         print(f"noise generator:             {self.__config.noise_method}")
         print(
             f"noise adjustment:            {'yes' if self.__config.noise_stddev_adj else 'no'}"
@@ -1081,9 +1102,6 @@ class StepsBlendingNowcaster:
                 compact_output=True,
             )
             precip_forecast_decomp.append(precip_forecast)
-        
-        
-
 
         # Rearrange the cascaded into a four-dimensional array of shape
         # (n_cascade_levels,ar_order+1,m,n) for the autoregressive model
@@ -1094,29 +1112,6 @@ class StepsBlendingNowcaster:
         precip_forecast_decomp = precip_forecast_decomp[-1]
         self.__state.mean_extrapolation = np.array(precip_forecast_decomp["means"])
         self.__state.std_extrapolation = np.array(precip_forecast_decomp["stds"])
-
-        # #NEW
-        # #Decompose precomputed nowcasts and rearange them again into the required components
-        # if self.__precip_nowcast != None:
-        #     precip_nowcast_decomp = []
-        #     for i in range(len(self.__precip_nowcast[0])):
-        #         precip_nowcast = self.__params.decomposition_method(
-        #             self.__precip_nowcast[i, :, :],
-        #             self.__params.bandpass_filter,
-        #             mask=self.__params.mask_threshold,
-        #             fft_method=self.__params.fft,
-        #             output_domain=self.__config.domain,
-        #             normalize=True,
-        #             compute_stats=True,
-        #             compact_output=True,
-        #         )
-        #         precip_nowcast_decomp.append(precip_nowcast)
-
-        # Rearrange the cascaded into a four-dimensional array of shape
-        # (n_cascade_levels,ar_order+1,m,n) for the autoregressive model
-        # self.__state.precip_nowcast_cascades = nowcast_utils.stack_cascades(
-        #     precip_nowcast_decomp, self.__config.n_cascade_levels
-        # )
 
         # If necessary, recompose (NWP) model forecasts
         self.__state.precip_models_cascades = None
@@ -1955,7 +1950,7 @@ class StepsBlendingNowcaster:
                 % self.__config.weights_method
             )
 
-    def __regress_extrapolation_and_noise_cascades(self, j, worker_state, t):
+    def __regress_extrapolation_and_noise_cascades(self, j, worker_state):
         """
         Apply autoregressive (AR) updates to the extrapolation and noise cascades
         for the next time step. If noise is enabled, generate and decompose a
@@ -1986,53 +1981,29 @@ class StepsBlendingNowcaster:
         else:
             epsilon_decomposed = None
 
-        # Regress the extrapolation component to the subsequent time
-        # step
-        # iterate the AR(p) model for each cascade level
-        
 
-        #If nowcast method seleced is DGMR, n_ens members has to be 1
-        if self.__config.nowcasting_method == 'DGMR':
-            print('Using nowcasting method1:', self.__config.nowcasting_method)
-            if self.__config.n_ens_members != 1:
-                raise ValueError(
-                    "number of ensemble members must be one when using deterministic DGMR as the nowcast!"
-                )
-            for i in range(self.__config.n_cascade_levels):
-                # apply AR(p) process to extrapolation cascade level
-                # use the deterministic DGMR model computed externally if
-                # perturbations are disabled
-                worker_state.precip_cascades[j][i] = (
-                    self.__precip_nowcast[t][i]
-                )
-
-                
-        elif self.__config.nowcasting_method == 'STEPS':
-            print('Using nowcasting method2:', self.__config.nowcasting_method)
-            for i in range(self.__config.n_cascade_levels):
-                # apply AR(p) process to extrapolation cascade level
-                if (
-                    epsilon_decomposed is not None
-                    or self.__config.velocity_perturbation_method is not None
-                ):
-                    print('input shape')
-                    
-                    print(worker_state.precip_cascades.shape)
-                    worker_state.precip_cascades[j][i] = autoregression.iterate_ar_model(
-                        worker_state.precip_cascades[j][i], self.__params.PHI[i, :]
-                    )
-                    print('output shape')
-                    print(worker_state.precip_cascades.shape)
-                    # Renormalize the cascade
-                    worker_state.precip_cascades[j][i][1] /= np.std(
-                        worker_state.precip_cascades[j][i][1]
-                    )
-                else:
-                    # use the deterministic AR(p) model computed above if
-                    # perturbations are disabled
-                    worker_state.precip_cascades[j][i] = (
-                        worker_state.final_blended_forecast_non_perturbed[i]
-                    )
+        # # Regress the extrapolation component to the subsequent time
+        # # step
+        # # iterate the AR(p) model for each cascade level
+        # for i in range(self.__config.n_cascade_levels):
+        #     # apply AR(p) process to extrapolation cascade level
+        #     if (
+        #         epsilon_decomposed is not None
+        #         or self.__config.velocity_perturbation_method is not None
+        #     ):
+        #         worker_state.precip_cascades[j][i] = autoregression.iterate_ar_model(
+        #             worker_state.precip_cascades[j][i], self.__params.PHI[i, :]
+        #         )
+        #         # Renormalize the cascade
+        #         worker_state.precip_cascades[j][i][1] /= np.std(
+        #             worker_state.precip_cascades[j][i][1]
+        #         )
+        #     else:
+        #         # use the deterministic AR(p) model computed above if
+        #         # perturbations are disabled
+        #         worker_state.precip_cascades[j][i] = (
+        #             worker_state.final_blended_forecast_non_perturbed[i]
+        #         )
 
         # Regress the noise component to the subsequent time step
         # iterate the AR(p) model for each cascade level
@@ -2882,7 +2853,6 @@ class StepsBlendingNowcaster:
 
 def forecast(
     precip,
-    precip_nowcast,
     precip_models,
     velocity,
     velocity_models,
@@ -2898,7 +2868,6 @@ def forecast(
     extrap_method="semilagrangian",
     decomp_method="fft",
     bandpass_filter_method="gaussian",
-    nowcasting_method = 'STEPS',
     noise_method="nonparametric",
     noise_stddev_adj=None,
     ar_order=2,
@@ -3010,8 +2979,6 @@ def forecast(
     bandpass_filter_method: {'gaussian', 'uniform'}, optional
       Name of the bandpass filter method to use with the cascade decomposition.
       See the documentation of :py:mod:`pysteps.cascade.interface`.
-    nowcasting_method: {'STEPS', 'DGMR'},
-      Name of the nowcasting method used to generate the
     noise_method: {'parametric','nonparametric','ssft','nested',None}, optional
       Name of the noise generator to use for perturbating the precipitation
       field. See the documentation of :py:mod:`pysteps.noise.interface`. If set to None,
@@ -3216,7 +3183,6 @@ def forecast(
         extrapolation_method=extrap_method,
         decomposition_method=decomp_method,
         bandpass_filter_method=bandpass_filter_method,
-        nowcasting_method=nowcasting_method,
         noise_method=noise_method,
         noise_stddev_adj=noise_stddev_adj,
         ar_order=ar_order,
@@ -3252,7 +3218,6 @@ def forecast(
     # Create an instance of the new class with all the provided arguments
     blended_nowcaster = StepsBlendingNowcaster(
         precip,
-        precip_nowcast,
         precip_models,
         velocity,
         velocity_models,
